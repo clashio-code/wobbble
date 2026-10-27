@@ -1,0 +1,396 @@
+name: build-arm64-gles3-probe
+on:
+  workflow_dispatch:
+  push:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Pasang toolchain ARM 64-bit
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Tulis sumber
+        run: |
+          mkdir -p src out/gles3_probe
+          cat > src/gles3probe.c <<'EOF_C1'
+          /* gles3probe - Gerbang #1 port Unity 2022 (Wobble Journey) ke muOS / Anbernic H700 (Mali-G31, aarch64).
+           * Pertanyaan yang dijawab: apakah SDL2 + driver Mali di device bisa membuat konteks OpenGL ES 3.x yang benar-benar jalan?
+           * HANYA MENGUJI: tidak memuat library game. Hasil ditulis ke stdout dan file laporan (argumen 1).
+           * Pakai: gles3probe [report.txt] [--all]   (--all = uji semua versi ES, bukan berhenti di yang pertama berhasil)
+           * Catatan glibc: JANGAN pakai strtol/sscanf/atoi dkk (build host baru mengikatnya ke GLIBC_2.38, device cuma 2.37). */
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <stdint.h>
+          #include <stdarg.h>
+          #include <time.h>
+          #include <dlfcn.h>
+          #include <unistd.h>
+          #include <sys/utsname.h>
+          #include <gnu/libc-version.h>
+
+          static FILE *rep;
+
+          static void P(const char *fmt, ...) {
+            va_list ap;
+            va_start(ap, fmt); vprintf(fmt, ap); va_end(ap);
+            if (rep) { va_start(ap, fmt); vfprintf(rep, fmt, ap); va_end(ap); fflush(rep); }
+            fflush(stdout);
+          }
+
+          static long long now_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (long long)t.tv_sec * 1000000000LL + t.tv_nsec; }
+
+          /* ======================= SDL2 (dlopen, tanpa header) ======================= */
+          typedef struct { uint32_t format; int w, h, refresh_rate; void *driverdata; } DMode;
+          static void *sdl_h;
+          static int (*p_SDL_Init)(uint32_t);
+          static void (*p_SDL_Quit)(void);
+          static const char *(*p_SDL_GetError)(void);
+          static void (*p_SDL_GetVersion)(uint8_t *);
+          static const char *(*p_SDL_GetCurrentVideoDriver)(void);
+          static int (*p_SDL_GetDesktopDisplayMode)(int, DMode *);
+          static int (*p_SDL_GL_SetAttribute)(int, int);
+          static void (*p_SDL_GL_ResetAttributes)(void);
+          static void *(*p_SDL_CreateWindow)(const char *, int, int, int, int, uint32_t);
+          static void (*p_SDL_DestroyWindow)(void *);
+          static void *(*p_SDL_GL_CreateContext)(void *);
+          static void (*p_SDL_GL_DeleteContext)(void *);
+          static void *(*p_SDL_GL_GetProcAddress)(const char *);
+          static int (*p_SDL_GL_SetSwapInterval)(int);
+          static void (*p_SDL_GL_SwapWindow)(void *);
+          static void (*p_SDL_GL_GetDrawableSize)(void *, int *, int *);
+
+          static int sdl_load(void) {
+            static const char *paths[] = { "libSDL2-2.0.so.0", "/usr/lib/libSDL2-2.0.so.0", "/usr/lib/aarch64-linux-gnu/libSDL2-2.0.so.0",
+              "/usr/lib64/libSDL2-2.0.so.0", "/lib/libSDL2-2.0.so.0", NULL };
+            int i;
+            for (i = 0; paths[i] && !sdl_h; i++) {
+              sdl_h = dlopen(paths[i], RTLD_NOW | RTLD_GLOBAL);
+              P("  dlopen %-46s : %s\n", paths[i], sdl_h ? "OK" : dlerror());
+            }
+            if (!sdl_h) return -1;
+          #define SYM(n) do { *(void **)&p_##n = dlsym(sdl_h, #n); if (!p_##n) { P("  simbol %s TIDAK ADA di SDL2\n", #n); return -1; } } while (0)
+            SYM(SDL_Init); SYM(SDL_Quit); SYM(SDL_GetError); SYM(SDL_GetVersion); SYM(SDL_GetCurrentVideoDriver);
+            SYM(SDL_GetDesktopDisplayMode); SYM(SDL_GL_SetAttribute); SYM(SDL_CreateWindow); SYM(SDL_DestroyWindow);
+            SYM(SDL_GL_CreateContext); SYM(SDL_GL_DeleteContext); SYM(SDL_GL_GetProcAddress); SYM(SDL_GL_SetSwapInterval);
+            SYM(SDL_GL_SwapWindow); SYM(SDL_GL_GetDrawableSize);
+          #undef SYM
+            *(void **)&p_SDL_GL_ResetAttributes = dlsym(sdl_h, "SDL_GL_ResetAttributes");   /* opsional (SDL >= 2.0.2) */
+            return 0;
+          }
+
+          /* ======================= fungsi GL (diambil per konteks lewat SDL_GL_GetProcAddress) ======================= */
+          static const unsigned char *(*g_glGetString)(unsigned);
+          static void (*g_glGetIntegerv)(unsigned, int *);
+          static unsigned (*g_glGetError)(void);
+          static void (*g_glGenVertexArrays)(int, unsigned *);
+          static void (*g_glBindVertexArray)(unsigned);
+          static void (*g_glDeleteVertexArrays)(int, const unsigned *);
+          static void (*g_glGenTextures)(int, unsigned *);
+          static void (*g_glBindTexture)(unsigned, unsigned);
+          static void (*g_glDeleteTextures)(int, const unsigned *);
+          static void (*g_glTexStorage2D)(unsigned, int, unsigned, int, int);
+          static void (*g_glCompressedTexImage2D)(unsigned, int, unsigned, int, int, int, int, const void *);
+          static unsigned (*g_glCreateShader)(unsigned);
+          static void (*g_glShaderSource)(unsigned, int, const char *const *, const int *);
+          static void (*g_glCompileShader)(unsigned);
+          static void (*g_glGetShaderiv)(unsigned, unsigned, int *);
+          static void (*g_glGetShaderInfoLog)(unsigned, int, int *, char *);
+          static void (*g_glDeleteShader)(unsigned);
+          static void (*g_glClearColor)(float, float, float, float);
+          static void (*g_glClear)(unsigned);
+
+          #define GLF(n) (*(void **)&g_##n = p_SDL_GL_GetProcAddress(#n))
+
+          static void gl_load(void) {
+            GLF(glGetString); GLF(glGetIntegerv); GLF(glGetError); GLF(glGenVertexArrays); GLF(glBindVertexArray);
+            GLF(glDeleteVertexArrays); GLF(glGenTextures); GLF(glBindTexture); GLF(glDeleteTextures); GLF(glTexStorage2D);
+            GLF(glCompressedTexImage2D); GLF(glCreateShader); GLF(glShaderSource); GLF(glCompileShader); GLF(glGetShaderiv);
+            GLF(glGetShaderInfoLog); GLF(glDeleteShader); GLF(glClearColor); GLF(glClear);
+          }
+
+          static void clr_err(void) { int n = 0; if (g_glGetError) while (g_glGetError() != 0 && n++ < 16) { } }
+          static int gi(unsigned pn) { int v = -1; clr_err(); if (g_glGetIntegerv) g_glGetIntegerv(pn, &v); clr_err(); return v; }
+          static const char *gs(unsigned pn) { const unsigned char *s = g_glGetString ? g_glGetString(pn) : NULL; return s ? (const char *)s : "(null)"; }
+
+          static int has_word(const char *list, const char *n) {
+            size_t l = strlen(n);
+            const char *p = list;
+            if (!list) return 0;
+            while ((p = strstr(p, n)) != NULL) {
+              if ((p == list || p[-1] == ' ') && (p[l] == ' ' || p[l] == 0)) return 1;
+              p += l;
+            }
+            return 0;
+          }
+
+          static int shader_ok(unsigned type, const char *src, const char *label) {
+            unsigned s;
+            int st = 0;
+            char log[512];
+            if (!g_glCreateShader || !g_glShaderSource || !g_glCompileShader || !g_glGetShaderiv) { P("    shader %-22s : fungsi GL tidak ada\n", label); return 0; }
+            clr_err();
+            s = g_glCreateShader(type);
+            g_glShaderSource(s, 1, &src, NULL);
+            g_glCompileShader(s);
+            g_glGetShaderiv(s, 0x8B81 /* COMPILE_STATUS */, &st);
+            if (!st && g_glGetShaderInfoLog) { log[0] = 0; g_glGetShaderInfoLog(s, (int)sizeof log, NULL, log); P("    shader %-22s : GAGAL | %s\n", label, log); }
+            else P("    shader %-22s : %s\n", label, st ? "OK" : "GAGAL");
+            if (g_glDeleteShader) g_glDeleteShader(s);
+            clr_err();
+            return st != 0;
+          }
+
+          /* uji unggah tekstur terkompresi 64x64 (data nol): hasilnya menentukan format tekstur mana yang boleh dipakai aset Android (ETC2/ASTC/DXT) */
+          static int comp_ok(unsigned fmt, int bytes, const char *name) {
+            static unsigned char buf[4096];
+            unsigned tex = 0, e;
+            if (!g_glGenTextures || !g_glBindTexture || !g_glCompressedTexImage2D) { P("    %-22s : fungsi GL tidak ada\n", name); return 0; }
+            clr_err();
+            g_glGenTextures(1, &tex);
+            g_glBindTexture(0x0DE1, tex);
+            g_glCompressedTexImage2D(0x0DE1, 0, fmt, 64, 64, 0, bytes, buf);
+            e = g_glGetError ? g_glGetError() : 0;
+            P("    %-22s : %s (glGetError=0x%x)\n", name, e == 0 ? "OK" : "TIDAK DIDUKUNG", e);
+            g_glBindTexture(0x0DE1, 0);
+            if (g_glDeleteTextures) g_glDeleteTextures(1, &tex);
+            clr_err();
+            return e == 0;
+          }
+
+          /* ======================= EGL & Vulkan (informasi saja) ======================= */
+          static void egl_report(void) {
+            static const char *want[] = { "EGL_KHR_fence_sync", "EGL_KHR_image_base", "EGL_KHR_gl_colorspace", "EGL_ANDROID_native_fence_sync",
+              "EGL_ANDROID_presentation_time", "EGL_KHR_surfaceless_context", NULL };
+            void *h = dlopen("libEGL.so.1", RTLD_NOW | RTLD_LOCAL);
+            void *(*cd)(void) = NULL;
+            const char *(*qs)(void *, int) = NULL;
+            void *dpy;
+            const char *ext;
+            int i;
+            if (!h) { P("  EGL: libEGL.so.1 tidak bisa dibuka (%s)\n", dlerror()); return; }
+            *(void **)&cd = dlsym(h, "eglGetCurrentDisplay");
+            *(void **)&qs = dlsym(h, "eglQueryString");
+            if (!cd || !qs) { P("  EGL: eglGetCurrentDisplay/eglQueryString tidak ada\n"); return; }
+            dpy = cd();
+            if (!dpy) { P("  EGL: tidak ada display aktif\n"); return; }
+            P("  EGL vendor : %s\n  EGL versi  : %s\n", qs(dpy, 0x3053), qs(dpy, 0x3054));
+            ext = qs(dpy, 0x3055);
+            for (i = 0; want[i]; i++) P("    %-32s %s\n", want[i], has_word(ext, want[i]) ? "ada" : "-");
+          }
+
+          static void vk_report(void) {
+            static const char *paths[] = { "libvulkan.so.1", "/usr/lib/libvulkan.so.1", "/usr/lib/aarch64-linux-gnu/libvulkan.so.1", "libvulkan.so", NULL };
+            void *h = NULL;
+            int i;
+            int (*evi)(uint32_t *) = NULL;
+            uint32_t v = 0;
+            for (i = 0; paths[i] && !h; i++) h = dlopen(paths[i], RTLD_NOW | RTLD_LOCAL);
+            if (!h) { P("  Vulkan: libvulkan tidak ada (tidak masalah: Unity bisa memakai GLES3)\n"); return; }
+            *(void **)&evi = dlsym(h, "vkEnumerateInstanceVersion");
+            if (evi && evi(&v) == 0) P("  Vulkan: loader ada, instance versi %u.%u.%u\n", v >> 22, (v >> 12) & 0x3ff, v & 0xfff);
+            else P("  Vulkan: loader ada, tapi vkEnumerateInstanceVersion tidak tersedia (Vulkan 1.0 / loader minimal)\n");
+          }
+
+          /* ======================= satu percobaan konteks ES maj.min ======================= */
+          static int g_gate, g_best_maj, g_best_min;
+          static double g_fps;
+
+          static int try_ctx(int maj, int min, int do_loop) {
+            static const char *want_ext[] = { "GL_KHR_texture_compression_astc_ldr", "GL_EXT_texture_compression_s3tc", "GL_EXT_color_buffer_float",
+              "GL_EXT_color_buffer_half_float", "GL_OES_EGL_image_external", "GL_EXT_texture_filter_anisotropic", "GL_EXT_disjoint_timer_query",
+              "GL_EXT_shader_framebuffer_fetch", "GL_ARM_shader_framebuffer_fetch", "GL_EXT_multisampled_render_to_texture",
+              "GL_ARM_mali_program_binary", "GL_OES_get_program_binary", NULL };
+            static const struct { const char *n; unsigned pn; } lim[] = { { "MAX_TEXTURE_SIZE", 0x0D33 }, { "MAX_VERTEX_ATTRIBS", 0x8869 },
+              { "MAX_TEXTURE_IMAGE_UNITS", 0x8872 }, { "MAX_DRAW_BUFFERS", 0x8824 }, { "MAX_COLOR_ATTACHMENTS", 0x8CDF }, { "MAX_SAMPLES", 0x8D57 },
+              { "MAX_ARRAY_TEXTURE_LAYERS", 0x88FF }, { "MAX_UNIFORM_BLOCK_SIZE", 0x8A30 }, { "DEPTH_BITS", 0x0D56 }, { "STENCIL_BITS", 0x0D57 }, { NULL, 0 } };
+            void *win, *ctx;
+            const char *exts;
+            int major, minor, w = 0, h = 0, i, ok_vao = 0, ok_tex = 0, ok_sh = 0;
+            unsigned vao = 0, tex = 0, e;
+
+            P("\n--- minta konteks OpenGL ES %d.%d ---\n", maj, min);
+            if (p_SDL_GL_ResetAttributes) p_SDL_GL_ResetAttributes();
+            p_SDL_GL_SetAttribute(0, 8); p_SDL_GL_SetAttribute(1, 8); p_SDL_GL_SetAttribute(2, 8); p_SDL_GL_SetAttribute(3, 0);
+            p_SDL_GL_SetAttribute(5, 1); p_SDL_GL_SetAttribute(6, 24); p_SDL_GL_SetAttribute(7, 8);   /* double buffer, depth24, stencil8 (seperti Unity) */
+            p_SDL_GL_SetAttribute(17, maj); p_SDL_GL_SetAttribute(18, min); p_SDL_GL_SetAttribute(21, 4 /* PROFILE_ES */);
+            win = p_SDL_CreateWindow("gles3probe", 0x1FFF0000, 0x1FFF0000, 640, 480, 0x00000002u | 0x00001001u);
+            if (!win) { P("  SDL_CreateWindow GAGAL: %s\n", p_SDL_GetError()); return 0; }
+            ctx = p_SDL_GL_CreateContext(win);
+            if (!ctx) { P("  SDL_GL_CreateContext GAGAL: %s\n", p_SDL_GetError()); p_SDL_DestroyWindow(win); return 0; }
+            gl_load();
+            p_SDL_GL_GetDrawableSize(win, &w, &h);
+            major = gi(0x821B); minor = gi(0x821C);
+            P("  konteks DIBUAT. drawable %dx%d\n", w, h);
+            P("  GL_VENDOR   : %s\n  GL_RENDERER : %s\n  GL_VERSION  : %s\n  GLSL        : %s\n", gs(0x1F00), gs(0x1F01), gs(0x1F02), gs(0x8B8C));
+            P("  GL_MAJOR/MINOR_VERSION: %d.%d\n", major, minor);
+
+            P("  batas perangkat keras:\n");
+            for (i = 0; lim[i].n; i++) P("    %-26s %d\n", lim[i].n, gi(lim[i].pn));
+
+            exts = gs(0x1F03);
+            P("  ekstensi penting:\n");
+            for (i = 0; want_ext[i]; i++) P("    %-40s %s\n", want_ext[i], has_word(exts, want_ext[i]) ? "ada" : "-");
+
+            P("  uji fungsional (bukti nyata, bukan sekadar nama fungsi ada):\n");
+            if (major >= 3 && g_glGenVertexArrays && g_glBindVertexArray) {
+              clr_err();
+              g_glGenVertexArrays(1, &vao); g_glBindVertexArray(vao); e = g_glGetError();
+              ok_vao = (e == 0 && vao != 0);
+              P("    VAO (ES3)               : %s (glGetError=0x%x)\n", ok_vao ? "OK" : "GAGAL", e);
+              g_glBindVertexArray(0); if (g_glDeleteVertexArrays) g_glDeleteVertexArrays(1, &vao);
+            } else P("    VAO (ES3)               : dilewati (bukan konteks ES3 / fungsi tidak ada)\n");
+            if (major >= 3 && g_glTexStorage2D && g_glGenTextures && g_glBindTexture) {
+              clr_err();
+              g_glGenTextures(1, &tex); g_glBindTexture(0x0DE1, tex); g_glTexStorage2D(0x0DE1, 1, 0x8058 /* RGBA8 */, 64, 64); e = g_glGetError();
+              ok_tex = (e == 0);
+              P("    glTexStorage2D RGBA8    : %s (glGetError=0x%x)\n", ok_tex ? "OK" : "GAGAL", e);
+              g_glBindTexture(0x0DE1, 0); if (g_glDeleteTextures) g_glDeleteTextures(1, &tex);
+            } else P("    glTexStorage2D RGBA8    : dilewati\n");
+            ok_sh = shader_ok(0x8B31, "#version 300 es\nlayout(location=0) in vec4 a;\nout vec2 v;\nvoid main(){ v=a.zw; gl_Position=vec4(a.xy,0.,1.); }\n", "vertex #version 300 es");
+            ok_sh &= shader_ok(0x8B30, "#version 300 es\nprecision mediump float;\nin vec2 v;\nlayout(location=0) out vec4 c;\nvoid main(){ c=vec4(v,0.,1.); }\n", "fragment #version 300 es");
+            if (major > 3 || (major == 3 && minor >= 1))
+              shader_ok(0x91B9, "#version 310 es\nlayout(local_size_x=8) in;\nvoid main(){}\n", "compute #version 310 es");
+            P("  format tekstur terkompresi (menentukan aset Android mana yang bisa dipakai):\n");
+            comp_ok(0x9274, 2048, "ETC2 RGB8");
+            comp_ok(0x93B0, 4096, "ASTC 4x4 RGBA");
+            comp_ok(0x83F0, 2048, "DXT1 (S3TC)");
+
+            egl_report();
+
+            if (major >= 3 && ok_vao && ok_tex && ok_sh) {
+              if (!g_gate) { g_gate = 1; g_best_maj = major; g_best_min = minor; }
+            }
+
+            if (do_loop && g_glClearColor && g_glClear) {
+              int f, frames = 180;
+              long long t0;
+              double sec;
+              P("  tes render+swap %d frame (layar akan berganti warna ~3 detik)...\n", frames);
+              p_SDL_GL_SetSwapInterval(1);
+              t0 = now_ns();
+              for (f = 0; f < frames; f++) {
+                g_glClearColor((float)(f % 60) / 60.f, 0.2f, 0.6f, 1.f);
+                g_glClear(0x4000);
+                p_SDL_GL_SwapWindow(win);
+              }
+              sec = (double)(now_ns() - t0) / 1e9;
+              g_fps = sec > 0.0 ? (double)frames / sec : 0.0;
+              P("  selesai: %.2f detik = %.1f fps (sekitar 60 berarti vsync normal) | glGetError=0x%x\n", sec, g_fps, g_glGetError ? g_glGetError() : 0);
+            }
+
+            p_SDL_GL_DeleteContext(ctx);
+            p_SDL_DestroyWindow(win);
+            return 1;
+          }
+
+          int main(int argc, char **argv) {
+            static const char *libs[] = { "libGLESv2.so.2", "libEGL.so.1", "libmali.so", "libmali.so.1", NULL };
+            static const int tries[][2] = { { 3, 2 }, { 3, 1 }, { 3, 0 }, { 2, 0 } };
+            const char *rpath = "gles3_report.txt";
+            int all = 0, i, got = 0;
+            struct utsname u;
+            DMode dm;
+            uint8_t sv[3] = { 0, 0, 0 };
+
+            for (i = 1; i < argc; i++) {
+              if (!strcmp(argv[i], "--all")) all = 1;
+              else if (argv[i][0] != '-') rpath = argv[i];
+            }
+            rep = fopen(rpath, "w");
+
+            P("== gles3probe (Gerbang 1: GLES 3.x untuk port Unity 2022) ==\n");
+            if (uname(&u) == 0) P("device: %s %s %s\n", u.sysname, u.release, u.machine);
+            P("glibc: %s | page size: %ld\n", gnu_get_libc_version(), (long)sysconf(_SC_PAGESIZE));
+            P("env: SDL_VIDEODRIVER=%s LD_LIBRARY_PATH=%s\n", getenv("SDL_VIDEODRIVER") ? getenv("SDL_VIDEODRIVER") : "(kosong)",
+              getenv("LD_LIBRARY_PATH") ? getenv("LD_LIBRARY_PATH") : "(kosong)");
+
+            P("\n== library grafik 64-bit di device ==\n");
+            for (i = 0; libs[i]; i++) { void *h = dlopen(libs[i], RTLD_NOW | RTLD_LOCAL); P("  %-16s %s\n", libs[i], h ? "OK" : "tidak ada"); }
+            vk_report();
+
+            P("\n== SDL2 ==\n");
+            if (sdl_load() != 0) { P("SDL2 tidak bisa dimuat. Berhenti.\n"); if (rep) fclose(rep); return 2; }
+            p_SDL_GetVersion(sv);
+            P("  SDL versi: %u.%u.%u\n", sv[0], sv[1], sv[2]);
+            if (p_SDL_Init(0x00000020u) != 0) { P("  SDL_Init(VIDEO) GAGAL: %s\n", p_SDL_GetError()); if (rep) fclose(rep); return 2; }
+            P("  video driver: %s\n", p_SDL_GetCurrentVideoDriver() ? p_SDL_GetCurrentVideoDriver() : "?");
+            memset(&dm, 0, sizeof dm);
+            if (p_SDL_GetDesktopDisplayMode(0, &dm) == 0) P("  display 0: %dx%d @ %d Hz\n", dm.w, dm.h, dm.refresh_rate);
+
+            for (i = 0; i < 4; i++) {
+              int ok = try_ctx(tries[i][0], tries[i][1], !got);
+              if (ok) got = 1;
+              if (got && !all) break;
+            }
+
+            P("\n== RINGKASAN ==\n");
+            if (g_gate) P("GERBANG 1: LULUS. Konteks OpenGL ES %d.%d jalan; VAO, glTexStorage2D, dan shader #version 300 es semua OK.\n", g_best_maj, g_best_min);
+            else if (got) P("GERBANG 1: GAGAL. Konteks dibuat tapi bukan ES3 yang sehat (lihat baris GAGAL/dilewati di atas).\n");
+            else P("GERBANG 1: GAGAL. Tidak ada konteks ES yang bisa dibuat lewat SDL2 di sistem ini.\n");
+            P("Kirim isi gles3_report.txt ke chat untuk dibaca.\n");
+            if (rep) fclose(rep);
+            p_SDL_Quit();
+            return g_gate ? 0 : 1;
+          }
+          EOF_C1
+          cat > out/GLES3Probe.sh <<'EOF_SH1'
+          #!/bin/bash
+          # GLES3 probe (Gerbang 1 port Unity 2022). Hanya menguji pembuatan konteks OpenGL ES 3.x lewat SDL2; tidak memuat game apa pun.
+          # Folder data dicari seperti launcher PortMaster lain: /$directory/ports/<nama>
+
+          XDG_DATA_HOME=${XDG_DATA_HOME:-$HOME/.local/share}
+
+          if [ -d "/opt/system/Tools/PortMaster/" ]; then
+            controlfolder="/opt/system/Tools/PortMaster"
+          elif [ -d "/opt/tools/PortMaster/" ]; then
+            controlfolder="/opt/tools/PortMaster"
+          elif [ -d "$XDG_DATA_HOME/PortMaster/" ]; then
+            controlfolder="$XDG_DATA_HOME/PortMaster"
+          else
+            controlfolder="/roms/ports/PortMaster"
+          fi
+
+          source $controlfolder/control.txt
+          [ -f "${controlfolder}/mod_${CFW_NAME}.txt" ] && source "${controlfolder}/mod_${CFW_NAME}.txt"
+
+          GAMEDIR="/$directory/ports/gles3_probe"
+          [ -d "$GAMEDIR" ] || GAMEDIR="$(cd "$(dirname "$0")" && pwd)/gles3_probe"
+
+          cd "$GAMEDIR" || {
+            echo "folder gles3_probe tidak ketemu. Dicari di: /$directory/ports/gles3_probe dan di sebelah script ini." > "$(dirname "$0")/gles3_error.txt"
+            exit 1
+          }
+
+          chmod +x ./gles3probe 2>/dev/null
+
+          echo "GAMEDIR=$GAMEDIR" > gles3_stdout.txt
+          uname -a >> gles3_stdout.txt 2>&1
+          ./gles3probe gles3_report.txt >> gles3_stdout.txt 2>&1
+          echo "exit code: $?" >> gles3_stdout.txt
+          sleep 2
+          type pm_finish >/dev/null 2>&1 && pm_finish
+          EOF_SH1
+
+      - name: Kompilasi (aarch64)
+        run: |
+          aarch64-linux-gnu-gcc -O2 -Wall -Wextra -o out/gles3_probe/gles3probe src/gles3probe.c -ldl
+          file out/gles3_probe/gles3probe || true
+          B=gles3probe
+          echo "--- $B: library yang dibutuhkan:"
+          aarch64-linux-gnu-readelf -d out/gles3_probe/$B | grep NEEDED
+          MAXV=$(aarch64-linux-gnu-readelf -V out/gles3_probe/$B | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -Vu | tail -1)
+          echo "$B butuh GLIBC tertinggi: $MAXV (device: 2.37 atau lebih baru)"
+          if [ "$(printf '%s\n%s\n' 2.37 "$MAXV" | sort -V | tail -1)" != "2.37" ]; then
+            echo "GAGAL: $B butuh glibc lebih baru dari 2.37. Simbol penyebab:"
+            aarch64-linux-gnu-nm -D --undefined-only out/gles3_probe/$B | grep -E 'GLIBC_2\.(3[89]|[4-9][0-9])'
+            exit 1
+          fi
+
+      - name: Unggah hasil build
+        uses: actions/upload-artifact@v4
+        with:
+          name: gles3-probe-arm64
+          path: out
