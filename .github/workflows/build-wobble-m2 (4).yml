@@ -46,6 +46,7 @@ jobs:
           #include <sys/syscall.h>
           #include <sys/prctl.h>
           #include <sys/utsname.h>
+          #include <sys/uio.h>
           #include <gnu/libc-version.h>
 
           #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
@@ -194,6 +195,18 @@ jobs:
           }
           static __thread uintptr_t t_fn;
           static volatile int g_in_sig; static int g_sig_events;
+          static int safe_read(uintptr_t a, void *buf, size_t n) {   /* process_vm_readv: gagal dengan EFAULT, tidak crash */
+            struct iovec lv, rv; lv.iov_base = buf; lv.iov_len = n; rv.iov_base = (void *)a; rv.iov_len = n;
+            return process_vm_readv(getpid(), &lv, 1, &rv, 1, 0) == (ssize_t)n ? 0 : -1;
+          }
+          static void dump_mem(const char *tag, uintptr_t a, size_t n) {
+            unsigned char b[128]; size_t i;
+            if (n > sizeof b) n = sizeof b;
+            if (safe_read(a, b, n) != 0) { L("  [mem] %s @%p: tidak terbaca\n", tag, (void *)a); return; }
+            L("  [mem] %s @%p:", tag, (void *)a);
+            for (i = 0; i < n; i++) L("%s%02x", i % 16 ? " " : "\n    ", b[i]);
+            L("\n");
+          }
           static void dump_ctx(const char *tag, int sig, siginfo_t *si, void *ctx) {
             ucontext_t *uc = (ucontext_t *)ctx; uintptr_t pc = 0, lr = 0, sp = 0; char b[300];
             (void)uc; (void)lr; (void)sp;
@@ -209,6 +222,12 @@ jobs:
               int k; uintptr_t fp = (uintptr_t)uc->uc_mcontext.regs[29], w, end; const MapEnt *sm = maps_find(sp); int shown = 0;
               for (k = 0; k < 30; k += 3)
                 L("    x%-2d=%016llx x%-2d=%016llx x%-2d=%016llx\n", k, (unsigned long long)uc->uc_mcontext.regs[k], k + 1, (unsigned long long)uc->uc_mcontext.regs[k + 1], k + 2, (unsigned long long)uc->uc_mcontext.regs[k + 2]);
+              {
+                uint32_t cw[24]; int q;
+                if (safe_read(pc - 64, cw, sizeof cw) == 0) { L("  [kode] word32 dari pc-64 (pc = indeks 16):"); for (q = 0; q < 24; q++) L("%s%08x", q % 8 ? " " : "\n    ", cw[q]); L("\n"); }
+                if (si && si->si_addr) dump_mem("alamat fault -16", (uintptr_t)si->si_addr - 16, 64);
+                dump_mem("x0", (uintptr_t)uc->uc_mcontext.regs[0], 64);
+              }
               L("  [bt] rantai frame-pointer dari x29=%p:\n", (void *)fp);
               for (k = 0; k < 32 && fp && !(fp & 7) && fp >= sp - 4096 && fp < sp + 0x800000; k++) {
                 const uintptr_t *fr = (const uintptr_t *)fp; uintptr_t ra = fr[1], nfp = fr[0];
@@ -218,7 +237,7 @@ jobs:
               }
               end = sm ? sm->hi : sp + 4096;
               L("  [stack-exec] kata di stack yang menunjuk ke kode:\n");
-              for (w = sp; w + 8 <= end && shown < 60; w += 8) {
+              for (w = sp; w + 8 <= end && shown < 20; w += 8) {
                 uintptr_t v = *(const uintptr_t *)w; const MapEnt *m = maps_find(v);
                 if (m && m->exec) { describe_addr(v, b, sizeof b); L("    sp+%lu: %p -> %s | %s\n", (unsigned long)(w - sp), (void *)v, m->name[0] ? m->name : "(anon)", b); shown++; }
               }
