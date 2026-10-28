@@ -566,7 +566,8 @@ jobs:
 
           /* ---- dl_iterate_phdr: modul yang kita muat sendiri tidak terlihat oleh glibc ---- */
           static int b_dl_iterate_phdr(int (*cb)(struct dl_phdr_info *, size_t, void *), void *data) {
-            int i, r;
+            int i, r; static int dcount;
+            if (dcount++ < 40) { char bb[300]; describe_addr((uintptr_t)__builtin_return_address(0), bb, sizeof bb); L("[SHIM] dl_iterate_phdr #%d dari %s [tid %d]\n", dcount, bb, b_gettid()); }
             for (i = 0; i < nmods; i++) {
               struct dl_phdr_info info; memset(&info, 0, sizeof info);
               info.dlpi_addr = (ElfW(Addr))mods[i].bias; info.dlpi_name = mods[i].name; info.dlpi_phdr = (const ElfW(Phdr) *)mods[i].ph;
@@ -1218,7 +1219,12 @@ jobs:
             if (!m) { L("[Java] methodID tak dikenal: %p\n", mid); return; }
             rp = strchr(m->sig, ')'); rt = rp ? rp[1] : 'V'; m->count++;
             fmt_args(m, a, args, sizeof args);
-            if (jlog_budget > 0 || m->count <= 3) { L("[Java] %s.%s(%s) -> %c\n", m->cls, m->name, args, rt); if (jlog_budget > 0) jlog_budget--; }
+            if (jlog_budget > 0 || m->count <= 3) {
+              if (!m->is_static && !strcmp(m->name, "length")) L("[Java] %s.%s(%s) -> %c  receiver=%p \"%.60s\"\n", m->cls, m->name, args, rt, t_jself, t_jself ? h2s(t_jself) : "(NULL!)");
+              else if (!m->is_static && !t_jself) L("[Java] %s.%s(%s) -> %c  receiver=NULL!\n", m->cls, m->name, args, rt);
+              else L("[Java] %s.%s(%s) -> %c\n", m->cls, m->name, args, rt);
+              if (jlog_budget > 0) jlog_budget--;
+            }
             if (rt == '[' && rp) { char et = rp[2]; r->l = arr_new((et == 'L' || et == '[') ? 'L' : et, 0); }
             else if (rt == 'L' && rp) {
               char cn[128]; const char *q = rp + 2; size_t k = 0;
@@ -1343,7 +1349,11 @@ jobs:
           static void *j_null1(void *env) { (void)env; return NULL; }
           static void *j_NewStringUTF(void *env, const char *s) { (void)env; return mk_handle(s ? s : ""); }
           static int j_GetStringUTFLength(void *env, void *s) { (void)env; return (int)strlen(h2s(s)); }
-          static const char *j_GetStringUTFChars(void *env, void *s, unsigned char *copy) { (void)env; if (copy) *copy = 0; return h2s(s); }
+          static const char *j_GetStringUTFChars(void *env, void *s, unsigned char *copy) {
+            static int n; (void)env; if (copy) *copy = 0;
+            if (n++ < 300) L("[JNI] GetStringUTFChars(%p) = \"%.80s\"\n", s, s ? h2s(s) : "(NULL!)");
+            return h2s(s);
+          }
           static void j_ReleaseStringUTFChars(void *env, void *s, const char *c) { (void)env; (void)s; (void)c; }
           typedef struct { const char *name; const char *sig; void *fn; } NativeMethod;
           static int j_RegisterNatives(void *env, void *cls, const NativeMethod *m, int n) {
